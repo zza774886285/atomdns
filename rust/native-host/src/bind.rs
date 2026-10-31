@@ -21,12 +21,33 @@ pub(crate) const UDP_RECEIVE_BUFFER_TARGET: usize = 4 * 1024 * 1024;
 
 pub(crate) async fn udp(address: SocketAddr) -> io::Result<UdpSocket> {
     let socket = match wildcard(Type::DGRAM, Protocol::UDP, address)? {
-        Wildcard::Bound(socket) => socket,
-        Wildcard::Other => plain_udp(address)?,
-        Wildcard::NoIpv6(reason) => plain_udp(fallback(address, &reason))?,
+        Wildcard::Bound(socket) => {
+            // 「回包源地址」补丁：双栈通配 socket 上 IPv4 包以 v4-mapped 形式到达，
+            // 一个 IPV6_RECVPKTINFO 就同时覆盖两种地址族。
+            crate::pktinfo::enable(&socket, crate::pktinfo::Family::V6)?;
+            socket
+        }
+        Wildcard::Other => {
+            let socket = plain_udp(address)?;
+            crate::pktinfo::enable(&socket, socket_family(address))?;
+            socket
+        }
+        Wildcard::NoIpv6(reason) => {
+            let socket = plain_udp(fallback(address, &reason))?;
+            crate::pktinfo::enable(&socket, crate::pktinfo::Family::V4)?;
+            socket
+        }
     };
     tune_receive_buffer(&socket, address);
     UdpSocket::from_std(socket.into())
+}
+
+/// 「回包源地址」补丁：非通配绑定直接按地址族打开 pktinfo。
+fn socket_family(address: SocketAddr) -> crate::pktinfo::Family {
+    match address {
+        SocketAddr::V4(_) => crate::pktinfo::Family::V4,
+        SocketAddr::V6(_) => crate::pktinfo::Family::V6,
+    }
 }
 
 /// The receive buffer the kernel actually granted (`None` when unreadable).

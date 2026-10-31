@@ -139,9 +139,9 @@ impl UdpServer {
                         shutdown.cancel();
                     }
                 }
-                received = self.socket.recv_from(&mut packet) => {
+                received = crate::pktinfo::recv_from(&self.socket, &mut packet) => {
                     match received {
-                        Ok((length, peer)) => {
+                        Ok((length, peer, local)) => {
                             let raw = packet[..length].to_vec();
                             let socket = Arc::clone(&self.socket);
                             let Some(admission) = self.control.capture(&self.listener_tag, ListenerKind::Udp, self.listener_addr) else { continue; };
@@ -163,6 +163,7 @@ impl UdpServer {
                                     options,
                                     raw,
                                     peer,
+                                    local,
                                     request_shutdown,
                                     enable_audit,
                                     _admission: admission,
@@ -210,6 +211,8 @@ struct RequestTask {
     options: HostOptions,
     raw: Vec<u8>,
     peer: SocketAddr,
+    /// 「回包源地址」补丁：收包时的目的地址，回包要把它当源地址。
+    local: Option<crate::pktinfo::LocalAddr>,
     request_shutdown: TransportCancellation,
     enable_audit: bool,
     _admission: crate::runtime_snapshot::AdmittedSnapshot,
@@ -225,6 +228,7 @@ async fn process_request(task: RequestTask) {
         options,
         raw,
         peer,
+        local,
         request_shutdown,
         enable_audit,
         _admission,
@@ -335,6 +339,7 @@ async fn process_request(task: RequestTask) {
                 socket,
                 framed_response.expect("response is framed before the send await"),
                 peer,
+                local,
                 request_shutdown,
             )
             .await
@@ -347,12 +352,14 @@ async fn send_response(
     socket: Arc<UdpSocket>,
     response: Vec<u8>,
     peer: SocketAddr,
+    local: Option<crate::pktinfo::LocalAddr>,
     request_shutdown: TransportCancellation,
 ) -> QueryTerminalOutcome {
     send_response_after_gate(
         socket,
         response,
         peer,
+        local,
         request_shutdown,
         std::future::ready(()),
     )
@@ -363,6 +370,7 @@ async fn send_response_after_gate<F>(
     socket: Arc<UdpSocket>,
     response: Vec<u8>,
     peer: SocketAddr,
+    local: Option<crate::pktinfo::LocalAddr>,
     request_shutdown: TransportCancellation,
     before_send: F,
 ) -> QueryTerminalOutcome
@@ -370,7 +378,11 @@ where
     F: Future<Output = ()>,
 {
     before_send.await;
-    send_with_control(&request_shutdown, socket.send_to(&response, peer)).await
+    send_with_control(
+        &request_shutdown,
+        crate::pktinfo::send_to(&socket, &response, peer, local),
+    )
+    .await
 }
 
 async fn send_with_control<F>(
@@ -598,6 +610,7 @@ mod tests {
                 sender,
                 vec![0xaa, 0xbb],
                 peer,
+                None,
                 cancellation.clone(),
                 Arc::clone(&gate).notified_owned(),
             ));

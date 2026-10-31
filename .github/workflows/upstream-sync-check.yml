@@ -1,0 +1,67 @@
+name: Upstream sync check
+
+# 每周一 03:00（北京时间 = 周日 19:00 UTC）检查上游有没有新提交。
+# 有就开/更新一个 issue，并预演一次 merge 告诉你会不会冲突。
+# 注意：本仓库的默认分支是 vip-pktinfo，定时任务只在默认分支上生效。
+
+on:
+  schedule:
+    - cron: '0 19 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compare with upstream
+        id: diff
+        run: |
+          git remote add upstream https://github.com/jasonxtt/atomdns.git
+          git fetch --no-tags upstream main
+          BEHIND="$(git rev-list --count HEAD..upstream/main)"
+          UPSTREAM_SHA="$(git rev-parse --short upstream/main)"
+          MERGE="skip"
+          if [ "$BEHIND" -gt 0 ]; then
+            if git merge --no-commit --no-ff upstream/main >/dev/null 2>&1; then
+              MERGE="clean"
+            else
+              MERGE="conflict"
+            fi
+            git merge --abort 2>/dev/null || true
+          fi
+          {
+            echo "behind=$BEHIND"
+            echo "upstream_sha=$UPSTREAM_SHA"
+            echo "merge=$MERGE"
+          } >> "$GITHUB_OUTPUT"
+          echo "behind=$BEHIND merge=$MERGE upstream=$UPSTREAM_SHA"
+
+      - name: Report a pending sync
+        if: steps.diff.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHIND: ${{ steps.diff.outputs.behind }}
+          UPSTREAM_SHA: ${{ steps.diff.outputs.upstream_sha }}
+          MERGE: ${{ steps.diff.outputs.merge }}
+        run: |
+          TITLE="上游有新提交：需要同步 vip-pktinfo"
+          if [ "$MERGE" = "clean" ]; then
+            HOW="自动合并预演**通过**，通常一条 \`git merge upstream/main\` 就能过，push 后 CI 自动重编。"
+          else
+            HOW="自动合并预演**冲突**，大概率落在 \`rust/native-host/src/udp.rs\` / \`bind.rs\`，需要手工解。"
+          fi
+          BODY="$(printf '上游 `jasonxtt/atomdns` 领先 %s 个提交（最新 %s）。\n\n%s\n\n本地同步：\n```bash\ngit fetch upstream\ngit merge upstream/main\n# 解冲突后\ncargo test --manifest-path rust/Cargo.toml -p atomdns-native-host --lib pktinfo\ncargo build --release --target x86_64-unknown-linux-musl -p atomdns-native-host\ngit push origin vip-pktinfo\n```\n' "$BEHIND" "$UPSTREAM_SHA" "$HOW")"
+          NUM="$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number // empty')"
+          if [ -n "$NUM" ]; then
+            gh issue comment "$NUM" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
+          fi
