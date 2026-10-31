@@ -39,6 +39,14 @@ cd rust && cargo build --release --target x86_64-unknown-linux-musl -p atomdns-n
 # 产物 rust/target/x86_64-unknown-linux-musl/release/atomdns
 ```
 
+如果报 `failed to find tool "x86_64-linux-musl-gcc"`：那是 `ring` 的 C/asm 部分缺 musl C 编译器，
+装 zig 交叉编译（CI 走的就是这条，与上游一致）：
+
+```bash
+pip install ziglang cargo-zigbuild
+cd rust && cargo zigbuild --release --target x86_64-unknown-linux-musl -p atomdns-native-host
+```
+
 验证回包源地址（必须，别只看 `check`）：
 
 ```bash

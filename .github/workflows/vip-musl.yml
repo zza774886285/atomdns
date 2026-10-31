@@ -39,9 +39,16 @@ jobs:
       - name: Unit test (reply source address)
         run: cargo test --locked --manifest-path rust/Cargo.toml -p atomdns-native-host --lib pktinfo
 
+      # ring 的 C/asm 部分在 musl 目标上需要一个 musl C 编译器；上游也是用 zig 做
+      # musl 交叉编译（scripts/build-rust-release.sh 的 amd64-musl 分支），这里保持一致。
+      - name: Install zig (musl C cross compiler)
+        run: |
+          python3 -m pip install --user ziglang cargo-zigbuild
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Build static musl
         run: |
-          cargo build --locked --release --manifest-path rust/Cargo.toml \
+          cargo zigbuild --locked --release --manifest-path rust/Cargo.toml \
             --target x86_64-unknown-linux-musl -p atomdns-native-host
           file rust/target/x86_64-unknown-linux-musl/release/atomdns
 
