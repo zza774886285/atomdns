@@ -35,15 +35,6 @@ jobs:
           key: vip-musl-${{ hashFiles('rust/Cargo.lock') }}
           restore-keys: vip-musl-
 
-      # ring 有 C/asm 代码，交叉到 musl 需要 C 编译器；runner 没装 musl-gcc，
-      # 而且 cc-rs 找的是 x86_64-linux-musl-gcc 这个名字，所以要软链过去。
-      - name: Install musl-gcc
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-          sudo ln -sf /usr/bin/musl-gcc /usr/local/bin/x86_64-linux-musl-gcc
-          x86_64-linux-musl-gcc --version | head -1
-
       # 回包源地址的行为由这个单测守住：wildcard 监听必须用收包目的地址回包
       - name: Unit test (reply source address)
         run: cargo test --locked --manifest-path rust/Cargo.toml -p atomdns-native-host --lib pktinfo
