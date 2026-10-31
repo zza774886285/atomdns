@@ -25,6 +25,7 @@ mod matchers;
 mod memory;
 mod observer;
 mod plugins;
+mod pktinfo;
 mod policy;
 mod process_metrics;
 mod requery;
