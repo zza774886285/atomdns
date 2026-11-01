@@ -1,0 +1,198 @@
+name: Publish VIP release (WebUI-updatable)
+
+# 发一个能被 WebUI「检查更新 / 立即更新」识别的版本。
+#
+# 必须在 Actions 里手动触发并填版本号，push 不会自动发（避免误发）。
+# 版本号只能是 vX.Y.Z（纯数字三段），且必须严格大于目标机上已装的版本，
+# 否则 WebUI 不会提示更新。
+#
+# 传什么：
+#   - 二进制的自报版本必须逐字等于 tag，健康检查才过（这里用 ATOMDNS_BUILD_VERSION 钉住）
+#   - 清单里 required_config_schema 固定写 0：表示「纯二进制更新，别动配置」。
+#     否则更新会要求带配置包，而配置包会覆盖 /cus/atomdns/config_custom.yaml。
+#   - 目标机 /cus/atomdns/ui/main 存在，所以必须同时发 atomdns-webui.tar.gz，
+#     否则整个更新会被拒。
+#
+# 发完之后，releases.json 会更新并被提交回本分支；目标机用这个地址查更新：
+#   ATOMDNS_UPDATE_API_URL=https://raw.githubusercontent.com/zza774886285/atomdns/vip-pktinfo/releases.json
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号，必须形如 v0.6.2（严格大于目标机已装版本）'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate the version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! [[ "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "版本号必须形如 vX.Y.Z，收到 ${VERSION}" >&2
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
+            echo "tag ${VERSION} 已存在，换一个更大的版本号" >&2
+            exit 1
+          fi
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: vip-release-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: vip-release-
+
+      # 回包源地址的行为由这个单测守住
+      - name: Unit test (reply source address)
+        run: cargo test --locked --manifest-path rust/Cargo.toml -p atomdns-native-host --lib pktinfo
+
+      - name: Install zig (musl C cross compiler)
+        run: |
+          python3 -m pip install --user ziglang cargo-zigbuild
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build static musl
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          ATOMDNS_BUILD_VERSION="${VERSION}" cargo zigbuild --locked --release \
+            --manifest-path rust/Cargo.toml --target x86_64-unknown-linux-musl -p atomdns-native-host
+          BIN=rust/target/x86_64-unknown-linux-musl/release/atomdns
+          file "${BIN}"
+          REPORTED="$("${BIN}" version)"
+          if [ "${REPORTED}" != "${VERSION}" ]; then
+            echo "二进制自报版本 ${REPORTED} 与 ${VERSION} 不一致，健康检查会失败并回滚" >&2
+            exit 1
+          fi
+          mkdir -p stage
+          cp "${BIN}" stage/atomdns
+          chmod 0755 stage/atomdns
+
+      - name: Build the WebUI package
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          cd webui-log
+          npm ci --include=dev
+          UI_VERSION="${VERSION}" npm run build:package
+
+      - name: Assemble the release assets
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # 上游 updater 认这个名字；目标机是 musl 构建，会优先装 -musl 包
+          tar --format=ustar --owner=0 --group=0 --numeric-owner -czf out/atomdns-linux-amd64-musl.tar.gz -C stage atomdns
+          # 清单里必须有这个 key（updater 的必需资产名），静态 musl 包在 glibc 机器上也能跑，直接用同一份
+          cp out/atomdns-linux-amd64-musl.tar.gz out/atomdns-linux-amd64.tar.gz
+          cp release/atomdns-webui.tar.gz out/atomdns-webui.tar.gz
+          tar -xzOf out/atomdns-webui.tar.gz ui-manifest.json | jq -e --arg v "${VERSION}" '.ui_version == $v' >/dev/null
+
+          sha() { sha256sum "$1" | awk '{print $1}'; }
+          BIN_SHA="$(sha out/atomdns-linux-amd64.tar.gz)"
+          MUSL_SHA="$(sha out/atomdns-linux-amd64-musl.tar.gz)"
+          UI_SHA="$(sha out/atomdns-webui.tar.gz)"
+
+          jq -n --arg v "${VERSION}" \
+                --arg bin "${BIN_SHA}" --arg musl "${MUSL_SHA}" --arg ui "${UI_SHA}" \
+            '{format: 1,
+              channel: "rust",
+              version: $v,
+              required_config_schema: 0,
+              config_package_id: "",
+              artifacts: {
+                "atomdns-linux-amd64.tar.gz":      {sha256: $bin},
+                "atomdns-linux-amd64-musl.tar.gz": {sha256: $musl},
+                "atomdns-webui.tar.gz":            {sha256: $ui}
+              }}' > out/atomdns-update-manifest.json
+
+          jq . out/atomdns-update-manifest.json
+          ls -l out
+
+      - name: Publish the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: ${{ inputs.version }}
+          files: |
+            out/atomdns-linux-amd64.tar.gz
+            out/atomdns-linux-amd64-musl.tar.gz
+            out/atomdns-webui.tar.gz
+            out/atomdns-update-manifest.json
+          body: |
+            atomdns 补丁版 ${VERSION}：UDP 回包源地址取收包目的地址（`IP_PKTINFO` / `IPV6_RECVPKTINFO`），
+            可在 keepalived VIP（如 10.1.1.100 / fe80::100）上正常应答。
+
+            - 静态链接（musl），Debian 12/13 直接跑
+            - 可在 WebUI 里「检查更新 → 立即更新」直接升级（清单要求配置 schema 0，即不改配置）
+            - 上游 commit：${{ github.sha }}
+            - 装完务必用 `dig @<VIP>` 确认回包源是 VIP
+
+      - name: Update releases.json
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/zza774886285/atomdns/releases/download/${VERSION}"
+          NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          BIN_SHA="$(jq -r '.artifacts["atomdns-linux-amd64.tar.gz"].sha256' out/atomdns-update-manifest.json)"
+          MUSL_SHA="$(jq -r '.artifacts["atomdns-linux-amd64-musl.tar.gz"].sha256' out/atomdns-update-manifest.json)"
+          UI_SHA="$(jq -r '.artifacts["atomdns-webui.tar.gz"].sha256' out/atomdns-update-manifest.json)"
+
+          entry="$(jq -n \
+            --arg tag "${VERSION}" --arg base "${BASE}" --arg now "${NOW}" \
+            --arg bin "${BIN_SHA}" --arg musl "${MUSL_SHA}" --arg ui "${UI_SHA}" '{
+              tag_name: $tag,
+              draft: false,
+              prerelease: false,
+              published_at: $now,
+              assets: [
+                {name: "atomdns-linux-amd64.tar.gz",      browser_download_url: ($base + "/atomdns-linux-amd64.tar.gz"),      updated_at: $now, digest: ("sha256:" + $bin)},
+                {name: "atomdns-linux-amd64-musl.tar.gz", browser_download_url: ($base + "/atomdns-linux-amd64-musl.tar.gz"), updated_at: $now, digest: ("sha256:" + $musl)},
+                {name: "atomdns-webui.tar.gz",            browser_download_url: ($base + "/atomdns-webui.tar.gz"),            updated_at: $now, digest: ("sha256:" + $ui)},
+                {name: "atomdns-update-manifest.json",    browser_download_url: ($base + "/atomdns-update-manifest.json"),    updated_at: $now}
+              ]
+            }')"
+
+          if [ -f releases.json ]; then base_json="$(cat releases.json)"; else base_json='[]'; fi
+          jq --argjson entry "${entry}" \
+            '([$entry] + map(select(.tag_name != $entry.tag_name)))
+             | sort_by(.published_at) | reverse | .[0:20]' <<<"${base_json}" > releases.json.new
+          mv releases.json.new releases.json
+          jq -e 'length >= 1 and (.[0].tag_name | startswith("v"))' releases.json >/dev/null
+          jq -r '.[].tag_name' releases.json
+
+      - name: Commit releases.json
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add releases.json
+          if git diff --cached --quiet; then
+            echo "releases.json 没有变化"
+            exit 0
+          fi
+          git commit -m "release: ${{ inputs.version }} in releases.json"
+          git push origin HEAD:vip-pktinfo
