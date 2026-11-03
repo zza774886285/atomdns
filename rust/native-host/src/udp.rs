@@ -241,7 +241,11 @@ async fn process_request(task: RequestTask) {
             // and is not itself a response, so clients do not wait for a timeout.
             observer.record_malformed();
             if let Some(reply) = atomdns_dns_core::query_error_reply(&raw, error) {
-                let _ = send_with_control(&request_shutdown, socket.send_to(&reply, peer)).await;
+                let _ = send_with_control(
+                    &request_shutdown,
+                    crate::pktinfo::send_to(&socket, &reply, peer, local),
+                )
+                .await;
             }
             return;
         }
