@@ -101,10 +101,25 @@ jobs:
           if git merge --no-edit "${UP}"; then
             echo "merged=clean" >> "$GITHUB_OUTPUT"
           else
-            echo "::error::merge ${TAG} 冲突（多半在 udp.rs / bind.rs），需要人工 rebase"
-            git merge --abort 2>/dev/null || true
-            echo "merged=conflict" >> "$GITHUB_OUTPUT"
-            exit 1
+            CONFLICTS="$(git diff --name-only --diff-filter=U)"
+            echo "冲突文件：${CONFLICTS//$'\n'/, }"
+            # 只冲突在「生成文件」就交给下一步自动重整；碰到收发路径才算真需要人工
+            DERIVED_ONLY=1
+            while IFS= read -r f; do
+              case "$f" in
+                rust/Cargo.lock|rust/native-host/Cargo.toml) ;;
+                *) DERIVED_ONLY=0 ;;
+              esac
+            done <<< "$CONFLICTS"
+            if [ "${DERIVED_ONLY}" = "1" ] && [ -n "${CONFLICTS}" ]; then
+              echo "::notice::merge ${TAG} 只冲突在生成文件（Cargo.lock / Cargo.toml），下一步自动重整"
+              echo "merged=derived" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::merge ${TAG} 冲突（${CONFLICTS//$'\n'/ }），需要人工 rebase"
+              git merge --abort 2>/dev/null || true
+              echo "merged=conflict" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
           fi
 
       - name: Set up Rust
@@ -123,6 +138,42 @@ jobs:
             rust/target
           key: auto-sync-${{ hashFiles('rust/Cargo.lock') }}
           restore-keys: auto-sync-
+
+      # Cargo.lock 是生成文件：上游和我们各加一行依赖，git 会当成同一处冲突。
+      # 处理办法是取上游版本，再让 cargo 按 Cargo.toml 重算，不手工解。
+      - name: Regenerate Cargo.lock after lock-only conflict
+        if: steps.detect.outputs.skip == 'false' && steps.merge.outputs.merged == 'derived'
+        run: |
+          set -euo pipefail
+          if git diff --name-only --diff-filter=U | grep -qx 'rust/native-host/Cargo.toml'; then
+            git checkout --theirs -- rust/native-host/Cargo.toml
+            python3 - <<'PY'
+          import pathlib, re
+          p = pathlib.Path('rust/native-host/Cargo.toml')
+          t = p.read_text()
+          if re.search(r'^libc\s*=', t, re.M):
+              print('Cargo.toml: libc 依赖行已存在')
+          else:
+              marker = "[target.'cfg(target_os = \"linux\")'.dependencies]"
+              i = t.index(marker) + len(marker)
+              p.write_text(t[:i] + '\nlibc = "0.2"' + t[i:])
+              print('Cargo.toml: 已补回 libc 依赖行')
+          PY
+            git add rust/native-host/Cargo.toml
+          fi
+          if git diff --name-only --diff-filter=U | grep -qx 'rust/Cargo.lock'; then
+            git checkout --theirs -- rust/Cargo.lock
+            git add rust/Cargo.lock
+          fi
+          ( cd rust && cargo metadata --format-version 1 > /dev/null )
+          git add rust/Cargo.lock
+          UNMERGED="$(git diff --name-only --diff-filter=U)"
+          if [ -n "${UNMERGED}" ]; then
+            echo "::error::重整后仍有未解决冲突：${UNMERGED//$'\n'/ }"
+            exit 1
+          fi
+          git commit --no-edit
+          git log --oneline -1
 
       - name: Unit test (pktinfo)
         if: steps.detect.outputs.skip == 'false'
@@ -285,7 +336,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           TITLE="上游自动同步失败：需要人工处理"
-          BODY="$(printf '自动同步上游 `%s` 时失败，**没有发版**。\n\n运行记录：%s\n\n常见原因：\n- merge 冲突（`rust/native-host/src/udp.rs` / `bind.rs`）\n- pktinfo 单测失败\n- 端到端回包源验证失败（补丁被上游改动破坏）\n- 上游改动了 `webui-log` 构建\n\n处理完后手动跑一次本 workflow 即可（填上游 tag）。\n' "${TAG:-未知}" "${RUN_URL}")"
+          BODY="$(printf '自动同步上游 `%s` 时失败，**没有发版**。\n\n运行记录：%s\n\n常见原因：\n- merge 冲突且落在非生成文件（`rust/native-host/src/udp.rs` / `bind.rs`）\n- pktinfo 单测失败\n- 端到端回包源验证失败（补丁被上游改动破坏）\n- 上游改动了 `webui-log` 构建\n\n说明：只冲突在 `Cargo.lock` / `Cargo.toml` 时 workflow 会自动重整，不会再报这个 issue。\n处理完后手动跑一次本 workflow 即可（填上游 tag）。\n' "${TAG:-未知}" "${RUN_URL}")"
           NUM="$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number // empty')"
           if [ -n "$NUM" ]; then
             gh issue comment "$NUM" --body "$BODY"
