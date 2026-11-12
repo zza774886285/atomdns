@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 
-import { isNativeUpstreamReadOnly } from '../src/api/nativeManagement.js'
+import { isNativeUpstreamReadOnly, nativeUpstreamProtocol, nativeUpstreamProtocolFields } from '../src/api/nativeManagement.js'
 import { requestOperation } from '../src/api/runtimeCapabilities.js'
 import {
   isModified,
@@ -41,7 +41,31 @@ test('only protocols that can use a proxy carry a checked switch', () => {
     assert.equal(nativeProxyFlag(protocol, true), true)
     assert.equal(nativeProxyFlag(protocol, false), false)
   }
-  for (const protocol of ['udp', 'aliapi', '', undefined]) assert.equal(nativeProxyFlag(protocol, true), false, String(protocol))
+  for (const protocol of ['udp', 'h3', 'quic', 'doq', 'aliapi', '', undefined]) assert.equal(nativeProxyFlag(protocol, true), false, String(protocol))
+})
+
+test('QUIC upstream editing follows runtime capabilities and refuses a proxy', () => {
+  const capable = { ...settingsBacked, upstream_protocols: [...settingsBacked.upstream_protocols, 'h3', 'quic'], unsupported_features: [] }
+  for (const [entry, protocol] of [
+    [{ protocol: 'https', addr: 'https://dns.example/dns-query', enable_http3: true }, 'h3'],
+    [{ protocol: 'h3', addr: 'h3://dns.example/dns-query' }, 'h3'],
+    [{ protocol: 'doq', addr: 'doq://dns.example' }, 'quic']
+  ]) {
+    assert.equal(nativeUpstreamProtocol(entry), protocol)
+    assert.equal(isNativeUpstreamReadOnly(entry, settingsBacked).readOnly, true)
+    assert.equal(isNativeUpstreamReadOnly(entry, capable).readOnly, false)
+    assert.equal(isNativeUpstreamReadOnly({ ...entry, use_socks_proxy: true }, capable).readOnly, true)
+  }
+})
+
+test('the upstream editor preserves explicit schemes and the HTTPS HTTP/3 flag', () => {
+  const https = 'https://dns.example/resolve?x=1'
+  const h3 = 'h3://dns.example/resolve?x=1'
+  assert.deepEqual(nativeUpstreamProtocolFields('h3', https), { protocol: 'https', addr: https, enable_http3: true })
+  assert.deepEqual(nativeUpstreamProtocolFields('h3', 'dns.example'), { protocol: 'https', addr: 'dns.example', enable_http3: true })
+  assert.deepEqual(nativeUpstreamProtocolFields('h3', h3), { protocol: 'h3', addr: h3 })
+  assert.deepEqual(nativeUpstreamProtocolFields('https', h3), { protocol: 'https', addr: h3 })
+  assert.deepEqual(nativeUpstreamProtocolFields('https', https), { protocol: 'https', addr: https })
 })
 
 test('effective items become the modified marks of the pages', () => {
@@ -84,8 +108,11 @@ test('the overrides apply at once with a restore per field, and no replacement r
 
 test('the upstream dialog offers the proxy switch only on a settings-backed runtime and never a literal address or an unsupported field', async () => {
   const source = await readFile(new URL('../src/components/rules/UpstreamEditorModal.vue', import.meta.url), 'utf8')
-  assert.match(source, /showProxy = computed\(\(\) => props\.proxySwitch && protocolUsesProxy\(form\.protocol\)\)/)
-  assert.match(source, /nativeProxyFlag\(form\.protocol, form\.use_socks_proxy\)/)
+  assert.match(source, /showProxy = computed\(\(\) => props\.proxySwitch && protocolUsesProxy\(effectiveProtocol\.value\)\)/)
+  assert.match(source, /nativeProxyFlag\(effectiveProtocol\.value, form\.use_socks_proxy\)/)
+  assert.match(source, /showHttp3 = computed\(\(\) => form\.protocol === 'https' && supported\.value\.has\('h3'\)\)/)
+  assert.match(source, /@change="setHttp3\(\$event\.target\.checked\)"/)
+  assert.doesNotMatch(source, /value: 'h3'/, 'HTTP/3 is a DoH toggle')
   for (const gone of ['idle_timeout', 'bind_to_device', 'so_mark', 'enable_pipeline', 'enable_http3', 'socks5', 'aliapi', 'account_id']) {
     assert.doesNotMatch(source, new RegExp(gone), `${gone} is not offered`)
   }
